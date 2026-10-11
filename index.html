@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="theme-color" content="#07070c">
+<title>Laser Synth Pad</title>
+<style>
+  :root {
+    --bg: #07070c; --panel: #12121b; --line: rgba(255,255,255,.07);
+    --text: #ececf4; --dim: #8b8ba3; --laser: #ff2d55; --ok: #30d158; --warn: #ffd60a;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; background: var(--bg); color: var(--text);
+    font: 15px/1.3 system-ui, -apple-system, Roboto, sans-serif; overflow: hidden; overscroll-behavior: none; }
+  body { display: flex; flex-direction: column; user-select: none; -webkit-user-select: none; }
+  header { display: flex; align-items: center; gap: 10px; padding: 10px 16px; background: var(--panel); }
+  #dot { flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--dim); }
+  #dot.on { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
+  #dot.wait { background: var(--warn); }
+  #status { flex: 1; min-width: 0; color: var(--dim); font-size: 14px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  button { font: inherit; font-weight: 600; border: 0; border-radius: 8px; padding: 9px 14px;
+    background: var(--laser); color: #fff; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--dim); padding: 9px 4px; font-weight: 400;
+    text-decoration: underline; font-size: 13px; }
+  #pad { position: relative; flex: 1; margin: 12px 16px 16px; border-radius: 16px;
+    border: 1px solid var(--line); touch-action: none; overflow: hidden;
+    background: radial-gradient(120% 90% at 50% 100%, #1a0710 0%, var(--bg) 70%); }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .lbl { position: absolute; color: var(--dim); font-size: 12px; pointer-events: none; letter-spacing: .03em; }
+  #lblY { left: 10px; top: 10px; }
+  #lblX { right: 12px; bottom: 10px; }
+  #hint { position: absolute; inset: 0; display: grid; place-items: center; text-align: center;
+    padding: 24px; color: var(--dim); pointer-events: none; }
+  #hint b { color: var(--text); }
+</style>
+</head>
+<body>
+<header>
+  <span id="dot"></span>
+  <span id="status">Not connected</span>
+  <button id="usbBtn" class="ghost" hidden>USB mode</button>
+  <button id="connectBtn">Connect</button>
+</header>
+<div id="pad">
+  <canvas id="cv"></canvas>
+  <span class="lbl" id="lblY">↑ pitch</span>
+  <span class="lbl" id="lblX">2nd voice volume →</span>
+  <div id="hint"><p>Plug the synth into your phone with a <b>USB-OTG adapter</b>,<br>tap <b>Connect</b>, then play here.</p></div>
+</div>
+
+<script>
+// ===== Settings (BAUD must match PHONE_BAUD in the Arduino sketch) =====
+const BAUD = 115200;
+const KEEPALIVE_MS = 100;   // Re-send position while finger is held still
+const BOOT_WAIT_MS = 2000;  // Nano reboots when the port opens; wait before sending
+
+const $ = id => document.getElementById(id);
+const pad = $('pad'), cv = $('cv'), ctx = cv.getContext('2d');
+
+// ===== Status =====
+function setStatus(kind, text) {
+  $('dot').className = kind;
+  $('status').textContent = text;
+}
+
+// ===== Transport: Web Serial if available, WebUSB as fallback =====
+let link = null;      // { write(bytes), close(), dev? }
+let ready = false;
+let busy = false, pending = null;
+const enc = new TextEncoder();
+
+// Only the newest message matters, so drop stale ones instead of queueing them.
+function send(msg) {
+  if (!link || !ready) return;
+  pending = msg;
+  pump();
+}
+async function pump() {
+  if (busy || !pending || !link) return;
+  busy = true;
+  const msg = pending; pending = null;
+  try { await link.write(enc.encode(msg)); } catch (e) { lost(); }
+  busy = false;
+  if (pending) pump();
+}
+
+async function openSerial() {
+  const port = await navigator.serial.requestPort();
+  await port.open({ baudRate: BAUD });
+  const writer = port.writable.getWriter();
+  port.addEventListener('disconnect', lost);
+  return {
+    write: d => writer.write(d),
+    close: async () => { try { writer.releaseLock(); await port.close(); } catch {} },
+  };
+}
+
+// Common USB-serial chips: CH340 (most Nano clones), FTDI, CP210x, genuine Arduino (CDC)
+const USB_FILTERS = [0x1a86, 0x0403, 0x10c4, 0x2341, 0x2a03, 0x1b4f].map(vendorId => ({ vendorId }));
+
+async function openUsb() {
+  const dev = await navigator.usb.requestDevice({ filters: USB_FILTERS });
+  await dev.open();
+  if (!dev.configuration) await dev.selectConfiguration(1);
+  const ifaces = dev.configuration.interfaces;
+
+  let dataIf = null, outEp = 0;
+  for (const i of ifaces) {
+    const ep = i.alternate.endpoints.find(e => e.direction === 'out' && e.type === 'bulk');
+    if (ep) { dataIf = i; outEp = ep.endpointNumber; break; }
+  }
+  if (!dataIf) throw new Error('No serial endpoint on this device');
+  await dev.claimInterface(dataIf.interfaceNumber);
+
+  const out = (request, value, index, recipient = 'device', requestType = 'vendor', data) =>
+    dev.controlTransferOut({ requestType, recipient, request, value, index }, data);
+  const inp = (request, value, index) =>
+    dev.controlTransferIn({ requestType: 'vendor', recipient: 'device', request, value, index }, 8);
+
+  if (dev.vendorId === 0x1a86) {            // CH340 / CH341
+    const baud = async () => { await out(0x9a, 0x1312, 0xcc03); await out(0x9a, 0x0f2c, 0x0008); }; // 115200
+    await inp(0x5f, 0, 0);
+    await out(0xa1, 0, 0);
+    await baud();
+    await inp(0x95, 0x2518, 0);
+    await out(0x9a, 0x2518, 0x0050);       // 8N1
+    await inp(0x95, 0x0706, 0);
+    await out(0xa1, 0x501f, 0xd90a);
+    await baud();
+    await out(0xa4, ~0x60 & 0xffff, 0);    // DTR + RTS on (active low)
+  } else if (dev.vendorId === 0x0403) {     // FTDI
+    await out(0x00, 0, 0);                  // reset
+    await out(0x03, 0x001a, 0);             // 115200 = 3 MHz / 26
+    await out(0x04, 0x0008, 0);             // 8N1
+    await out(0x01, 0x0303, 0);             // DTR + RTS
+  } else if (dev.vendorId === 0x10c4) {     // CP210x
+    const n = dataIf.interfaceNumber;
+    const b = new ArrayBuffer(4); new DataView(b).setUint32(0, BAUD, true);
+    await out(0x00, 0x0001, n, 'interface');
+    await out(0x1e, 0, n, 'interface', 'vendor', b);
+    await out(0x03, 0x0800, n, 'interface');
+    await out(0x07, 0x0303, n, 'interface');
+  } else {                                  // CDC-ACM
+    const ctrl = ifaces.find(i => i.alternate.interfaceClass === 2);
+    const n = ctrl ? ctrl.interfaceNumber : 0;
+    if (ctrl && !ctrl.claimed) await dev.claimInterface(n);
+    const lc = new ArrayBuffer(7), v = new DataView(lc);
+    v.setUint32(0, BAUD, true); v.setUint8(4, 0); v.setUint8(5, 0); v.setUint8(6, 8);
+    await out(0x20, 0, n, 'interface', 'class', lc);
+    await out(0x22, 0x03, n, 'interface', 'class');
+  }
+
+  return {
+    dev,
+    write: d => dev.transferOut(outEp, d),
+    close: async () => { try { await dev.close(); } catch {} },
+  };
+}
+
+if ('usb' in navigator) {
+  navigator.usb.addEventListener('disconnect', e => { if (link && link.dev === e.device) lost(); });
+}
+
+async function connect(forceUsb) {
+  if (link) { await link.close(); lost(); return; }
+  try {
+    setStatus('wait', 'Pick your synth…');
+    const useSerial = !forceUsb && 'serial' in navigator;
+    if (!useSerial && !('usb' in navigator)) throw new Error('Use Chrome on Android');
+    link = useSerial ? await openSerial() : await openUsb();
+    $('connectBtn').textContent = 'Disconnect';
+    setStatus('wait', 'Synth is starting…');
+    keepScreenOn();
+    setTimeout(() => {
+      if (!link) return;
+      ready = true;
+      setStatus('on', 'Connected, play!');
+      $('hint').hidden = true;
+    }, BOOT_WAIT_MS);
+  } catch (e) {
+    link = null;
+    setStatus('', e.name === 'NotFoundError' ? 'Nothing picked. Try "USB mode"?' : 'Error: ' + e.message);
+    // Offer the WebUSB fallback only if Connect didn't already use it
+    if ('serial' in navigator && 'usb' in navigator) $('usbBtn').hidden = false;
+  }
+}
+
+function lost() {
+  link = null; ready = false; busy = false; pending = null;
+  $('connectBtn').textContent = 'Connect';
+  $('hint').hidden = false;
+  setStatus('', 'Disconnected');
+}
+
+$('connectBtn').onclick = () => connect(false);
+$('usbBtn').onclick = () => connect(true);
+
+let wakeLock = null;
+async function keepScreenOn() {
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && link) keepScreenOn();
+});
+
+// ===== Touch pad =====
+// Protocol: "T<x>,<y>\n" with x,y in 0..1000 (y = 0 at bottom), "U\n" when the finger lifts.
+let touchId = null, pos = null, keepAlive = null;
+const trail = [];
+
+function sendPos() {
+  if (pos) send(`T${Math.round(pos.x * 1000)},${Math.round(pos.y * 1000)}\n`);
+}
+
+function track(e) {
+  const r = pad.getBoundingClientRect();
+  const clamp = v => Math.min(1, Math.max(0, v));
+  pos = { x: clamp((e.clientX - r.left) / r.width), y: clamp(1 - (e.clientY - r.top) / r.height) };
+  trail.push({ ...pos, t: performance.now() });
+  sendPos();
+  requestDraw();
+}
+
+pad.addEventListener('pointerdown', e => {
+  if (touchId !== null) return;
+  touchId = e.pointerId;
+  pad.setPointerCapture(e.pointerId);
+  navigator.vibrate?.(8);
+  track(e);
+  keepAlive = setInterval(sendPos, KEEPALIVE_MS);
+});
+pad.addEventListener('pointermove', e => { if (e.pointerId === touchId) track(e); });
+function release(e) {
+  if (e.pointerId !== touchId) return;
+  touchId = null; pos = null;
+  clearInterval(keepAlive);
+  send('U\n');
+  requestDraw();
+}
+pad.addEventListener('pointerup', release);
+pad.addEventListener('pointercancel', release);
+
+// ===== Drawing =====
+let drawQueued = false;
+function requestDraw() {
+  if (!drawQueued) { drawQueued = true; requestAnimationFrame(draw); }
+}
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = pad.clientWidth * dpr;
+  cv.height = pad.clientHeight * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  requestDraw();
+}
+new ResizeObserver(resize).observe(pad);
+
+function draw() {
+  drawQueued = false;
+  const w = pad.clientWidth, h = pad.clientHeight, now = performance.now();
+  ctx.clearRect(0, 0, w, h);
+
+  ctx.strokeStyle = 'rgba(255,255,255,.05)';
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 12; i++) {
+    const y = Math.round(h * i / 12) + .5;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  for (let i = 1; i < 6; i++) {
+    const x = Math.round(w * i / 6) + .5;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  }
+
+  while (trail.length && now - trail[0].t > 400) trail.shift();
+  for (const p of trail) {
+    const a = 1 - (now - p.t) / 400;
+    ctx.fillStyle = `rgba(255,45,85,${a * .35})`;
+    ctx.beginPath(); ctx.arc(p.x * w, (1 - p.y) * h, 14 * a + 2, 0, Math.PI * 2); ctx.fill();
+  }
+
+  if (pos) {
+    const x = pos.x * w, y = (1 - pos.y) * h;
+    ctx.strokeStyle = 'rgba(255,45,85,.45)';
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+    ctx.shadowColor = '#ff2d55'; ctx.shadowBlur = 24;
+    ctx.fillStyle = '#ff2d55';
+    ctx.beginPath(); ctx.arc(x, y, 18, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2); ctx.fill();
+  }
+
+  if (trail.length) requestDraw();
+}
+</script>
+</body>
+</html>
